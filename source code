@@ -1,0 +1,343 @@
+import os
+import re
+import xml.etree.ElementTree as ET
+import tkinter as tk
+from tkinter import filedialog
+import pandas as pd
+from datetime import datetime
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import cm
+import matplotlib.pyplot as plt
+from zipfile import ZipFile
+import colorama
+from colorama import Fore, init
+
+init(autoreset=True)
+
+def clean_code_text(text):
+    return text.replace('■', '').replace('\u2022', '').replace('\xa0', ' ').strip() if text else ''
+
+def draw_page_frame(c, width, height, margin, page_num):
+    c.rect(margin / 2, margin / 2, width - margin, height - margin, stroke=1, fill=0)
+    c.setFont("Helvetica", 9)
+    c.drawCentredString(width / 2, margin / 4, f"Page {page_num}")
+
+def count_lines(file_path):
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return sum(1 for line in f if line.strip())
+    except Exception as e:
+        print(Fore.RED + f"Failed to count lines in {file_path}: {e}")
+        return 0
+
+def process_sr_section(root_xml, output_root):
+    print(Fore.BLUE + "\nProcessing SR and Section programs...")
+
+    subfolder_SR = os.path.join(output_root, 'SR_Section', 'SR')
+    subfolder_section = os.path.join(output_root, 'SR_Section', 'Section')
+    os.makedirs(subfolder_SR, exist_ok=True)
+    os.makedirs(subfolder_section, exist_ok=True)
+
+    SR_CCL, section_CCL = [], []
+    type_SR, type_section = [], []
+    filenameslist_SR, filenameslist_section = [], []
+    SR_LOC, section_LOC = [], []
+
+    for idx, program in enumerate(root_xml.findall('program')):
+        ident_program = program.find('identProgram')
+        if ident_program is None or 'name' not in ident_program.attrib:
+            print(Fore.YELLOW + f"Skipping program {idx + 1}: no identProgram or name.")
+            continue
+
+        program_name = ident_program.attrib['name'].strip('"')
+        program_type = ident_program.attrib.get('type')
+        filename = f"{program_name}.txt"
+        st_source_element = program.find('STSource')
+        st_source = st_source_element.text.strip() if st_source_element is not None and st_source_element.text else ""
+
+        if program_type == 'section':
+            filepath = os.path.join(subfolder_section, filename)
+            filenameslist_section.append(filename)
+            type_section.append(program_type)
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(st_source)
+            num_lines = count_lines(filepath)
+            comments = re.findall(r'\(\.?\*\)', st_source, re.DOTALL)
+            section_CCL.append(len(comments))
+            section_LOC.append(num_lines)
+            print(Fore.CYAN + f"[Section] {filename}: Lines={num_lines}, Comments={len(comments)}, Ratio={len(comments)/num_lines if num_lines > 0 else 0:.2f}")
+
+        elif program_type == 'SR':
+            filepath = os.path.join(subfolder_SR, filename)
+            filenameslist_SR.append(filename)
+            type_SR.append(program_type)
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(st_source)
+            num_lines = count_lines(filepath)
+            comments = re.findall(r'\(\.?\*\)', st_source, re.DOTALL)
+            SR_CCL.append(len(comments))
+            SR_LOC.append(num_lines)
+            print(Fore.CYAN + f"[SR] {filename}: Lines={num_lines}, Comments={len(comments)}, Ratio={len(comments)/num_lines if num_lines > 0 else 0:.2f}")
+
+        else:
+            print(Fore.YELLOW + f"Unknown program type '{program_type}' for {program_name}")
+
+    # Save SR/Section summary CSV
+    csv_path = os.path.join(output_root, 'SR_Section', 'All_filenames.csv')
+    try:
+        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+        with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+            import csv
+            writer = csv.writer(csvfile)
+            writer.writerow(['Filename', 'Number of lines', 'Number of comments', 'Type'])
+            writer.writerows(zip(filenameslist_SR, SR_LOC, SR_CCL, type_SR))
+            writer.writerows(zip(filenameslist_section, section_LOC, section_CCL, type_section))
+        print(Fore.GREEN + f"SR/Section summary CSV saved to: {csv_path}")
+    except Exception as e:
+        print(Fore.RED + f"Failed to save SR/Section CSV: {e}")
+
+def process_dfb_sections(root_xml, output_root):
+    print(Fore.BLUE + "\nProcessing DFB FBSource sections...")
+
+    dfb_root = os.path.join(output_root, 'DFB')
+    os.makedirs(dfb_root, exist_ok=True)
+
+    report_dir = os.path.join(output_root, "Summary_Report")
+    os.makedirs(report_dir, exist_ok=True)
+
+    summary_data, fb_variable_counts, fb_code_snippets = [], {}, {}
+
+    for fbsource in root_xml.iter('FBSource'):
+        fb_type = fbsource.attrib.get('nameOfFBType', 'UnknownFB')
+        print(f"Processing FBSource: {fb_type}")
+        fb_output_folder = os.path.join(dfb_root, fb_type)
+        os.makedirs(fb_output_folder, exist_ok=True)
+
+        chart_dir = os.path.join(fb_output_folder, "charts")
+        os.makedirs(chart_dir, exist_ok=True)
+
+        code_snippets, variable_data, scope_counts = [], [], {}
+
+        for fbprogram in fbsource.iter('FBProgram'):
+            prog_name = fbprogram.attrib.get('name', 'UnnamedProgram')
+            st_source = fbprogram.find('STSource')
+            if st_source is not None and st_source.text:
+                code_text = clean_code_text(st_source.text)
+                with open(os.path.join(fb_output_folder, f"{prog_name}.txt"), 'w', encoding='utf-8') as f:
+                    f.write(code_text)
+                lines = code_text.split('\n')
+                total = len(lines)
+                comments = sum(1 for l in lines if re.search(r'\(\.?\*\)', l))
+                ratio = round((total - comments) / comments, 2) if comments > 0 else total
+                code_snippets.append((prog_name, code_text))
+                summary_data.append([fb_type, f"{prog_name}.txt", total, comments, ratio])
+            else:
+                print(Fore.YELLOW + f"Warning: No STSource in program '{prog_name}'")
+
+        fb_code_snippets[fb_type] = code_snippets
+
+        for scope, xpath in [
+            ('INOUT', './/inOutParameters//variables'),
+            ('PRIVATE', './/privateLocalVariables//variables'),
+            ('PUBLIC', './/publicLocalVariables//variables'),
+            ('INPUT', './/inputParameters//variables'),
+            ('OUTPUT', './/outputParameters//variables'),
+        ]:
+            scope_counts[scope] = 0
+            for var in fbsource.findall(xpath):
+                name = var.attrib.get('name', 'Unnamed')
+                dtype = var.attrib.get('typeName', 'Unknown')
+                comment = var.find('comment').text if var.find('comment') is not None else ''
+                variable_data.append([scope, name, dtype, comment])
+                scope_counts[scope] += 1
+
+        fb_variable_counts[fb_type] = scope_counts
+        var_df = pd.DataFrame(variable_data, columns=["Scope", "Name", "Data Type", "Comment"])
+        var_df.to_excel(os.path.join(fb_output_folder, f"{fb_type}_variables.xlsx"), index=False, engine='openpyxl')
+
+    # Summary and PDF generation
+    summary_excel_path = os.path.join(report_dir, "summary.xlsx")
+    summary_df = pd.DataFrame(summary_data, columns=["Type", "Text File Name", "Number of Lines", "Number of Comments", "Code-to-Comment Ratio"])
+    summary_df.to_excel(summary_excel_path, index=False, engine='openpyxl')
+
+    pdf_path = os.path.join(report_dir, f"DFB_report.pdf")
+    c = canvas.Canvas(pdf_path, pagesize=A4)
+    width, height = A4
+    margin = 2 * cm
+    y = height - margin
+    page_num = 1
+
+    draw_page_frame(c, width, height, margin, page_num)
+    c.setFont("Helvetica-Bold", 20)
+    c.drawCentredString(width / 2, y, "DFB Report")
+    y -= 2 * cm
+    c.setFont("Helvetica", 12)
+    c.drawCentredString(width / 2, y, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    c.showPage()
+    page_num += 1
+
+    for fb_type in fb_variable_counts:
+        y = height - margin
+        draw_page_frame(c, width, height, margin, page_num)
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(margin, y, f"FB Type: {fb_type}")
+        y -= 1 * cm
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(margin, y, "Programs:")
+        y -= 0.6 * cm
+        c.setFont("Helvetica", 10)
+
+        for row in summary_data:
+            if row[0] == fb_type:
+                line = f"{row[1]} - Total Lines: {row[2]}, Comments: {row[3]}, Ratio: {row[4]}"
+                c.drawString(margin + 0.5 * cm, y, line)
+                y -= 0.5 * cm
+                if y < 4 * cm:
+                    c.showPage()
+                    page_num += 1
+                    y = height - margin
+                    draw_page_frame(c, width, height, margin, page_num)
+
+        y -= 0.4 * cm
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(margin, y, "Variable Scope Counts:")
+        y -= 0.6 * cm
+        c.setFont("Helvetica", 10)
+        for scope, count in fb_variable_counts[fb_type].items():
+            c.drawString(margin + 0.5 * cm, y, f"{scope}: {count}")
+            y -= 0.4 * cm
+            if y < 4 * cm:
+                c.showPage()
+                page_num += 1
+                y = height - margin
+                draw_page_frame(c, width, height, margin, page_num)
+
+        chart_path = os.path.join(dfb_root, fb_type, "charts", f"{fb_type}_chart.png")
+        plt.figure(figsize=(6, 3))
+        plt.bar(fb_variable_counts[fb_type].keys(), fb_variable_counts[fb_type].values(), color='steelblue')
+        plt.title(f"{fb_type} Variable Scope Distribution", fontsize=10)
+        plt.tight_layout()
+        plt.savefig(chart_path)
+        plt.close()
+
+        if y < 8 * cm:
+            c.showPage()
+            page_num += 1
+            y = height - margin
+            draw_page_frame(c, width, height, margin, page_num)
+
+        c.drawImage(chart_path, margin, y - 6 * cm, width=16 * cm, height=6 * cm)
+        y -= 7 * cm
+
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(margin, y, "Code Previews:")
+        y -= 0.6 * cm
+        c.setFont("Courier", 7)
+        for prog_name, full_code in fb_code_snippets[fb_type]:
+            c.drawString(margin + 0.3 * cm, y, f"Program: {prog_name}")
+            y -= 0.4 * cm
+            for line in full_code.splitlines():
+                line = clean_code_text(line)
+                if y < 3 * cm:
+                    c.showPage()
+                    page_num += 1
+                    y = height - margin
+                    draw_page_frame(c, width, height, margin, page_num)
+                    c.setFont("Courier", 7)
+                c.drawString(margin + 0.5 * cm, y, line[:100])
+                y -= 0.35 * cm
+            y -= 0.5 * cm
+
+        c.showPage()
+        page_num += 1
+
+    # Overall Summary Table
+    y = height - margin
+    draw_page_frame(c, width, height, margin, page_num)
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(margin, y, "Overall Summary Table")
+    y -= 1 * cm
+
+    headers = ["Type", "File", "Code", "Com", "C2C"]
+    col_widths = [5 * cm, 5 * cm, 2 * cm, 2 * cm, 2 * cm]
+    x_positions = [margin]
+    for w in col_widths[:-1]:
+        x_positions.append(x_positions[-1] + w)
+
+    c.setFont("Helvetica-Bold", 11)
+    for i, header in enumerate(headers):
+        c.drawString(x_positions[i] + 2, y, header)
+    y -= 0.6 * cm
+
+    c.setFont("Helvetica", 10)
+    for row in summary_data:
+        if y < 3 * cm:
+            c.showPage()
+            page_num += 1
+            y = height - margin
+            draw_page_frame(c, width, height, margin, page_num)
+            c.setFont("Helvetica-Bold", 11)
+            for i, header in enumerate(headers):
+                c.drawString(x_positions[i] + 2, y, header)
+            y -= 0.6 * cm
+            c.setFont("Helvetica", 10)
+
+        for i, item in enumerate(row):
+            value = str(item)
+            if i >= 2:
+                c.drawRightString(x_positions[i] + col_widths[i] - 2, y, value)
+            else:
+                c.drawString(x_positions[i] + 2, y, value)
+        y -= 0.5 * cm
+
+    c.save()
+    print(Fore.GREEN + f"\n✅ PDF Report created: {pdf_path}")
+
+def main():
+    root = tk.Tk()
+    root.withdraw()
+    file_path = filedialog.askopenfilename(title="Select the .zef file", filetypes=[("ZEF files", ".zef"), ("All files", ".*")])
+
+    if not file_path:
+        print(Fore.RED + "No file selected. Exiting...")
+        return
+
+    try:
+        extract_dir = os.path.join(os.path.dirname(file_path), "temp_extracted")
+        os.makedirs(extract_dir, exist_ok=True)
+
+        with ZipFile(file_path, 'r') as zipObj:
+            target_file = next((name for name in zipObj.namelist() if os.path.basename(name).lower() == 'unitpro.xef'), None)
+            if not target_file:
+                raise FileNotFoundError("unitpro.xef not found in the archive.")
+            zipObj.extract(target_file, path=extract_dir)
+            extracted_path = os.path.join(extract_dir, target_file)
+
+        tree = ET.parse(extracted_path)
+        root_xml = tree.getroot()
+
+        base_name = os.path.splitext(os.path.basename(file_path))[0]
+        timestamp = datetime.now().strftime("%d%m%y%H%M%S")
+        output_root = f"{base_name}outputfiles{timestamp}"
+        os.makedirs(output_root, exist_ok=True)
+
+        process_sr_section(root_xml, output_root)
+        process_dfb_sections(root_xml, output_root)
+
+        zip_output_path = f"{output_root}.zip"
+        with ZipFile(zip_output_path, 'w') as zipf:
+            for foldername, _, filenames in os.walk(output_root):
+                for filename in filenames:
+                    file_path = os.path.join(foldername, filename)
+                    arcname = os.path.relpath(file_path, output_root)
+                    zipf.write(file_path, arcname)
+
+        print(Fore.GREEN + f"\n📁 All output files saved under: {output_root}")
+        print(Fore.GREEN + f"📦 All files compressed into: {zip_output_path}")
+
+    except Exception as e:
+        print(Fore.RED + f"Error: {e}")
+
+if _name_ == "_main_":
+    main()
